@@ -17,294 +17,372 @@ limitations under the License.
 package kubecfg
 
 import (
-	"encoding/json"
+	"bytes"
+	"io"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/clientauth"
 )
 
-// TODO: This doesn't reduce typing enough to make it worth the less readable errors. Remove.
-func expectNoError(t *testing.T, err error) {
-	if err != nil {
-		t.Errorf("Unexpected error: %#v", err)
-	}
-}
-
-type Action struct {
-	action string
-	value  interface{}
-}
-
-type FakeKubeClient struct {
-	actions []Action
-	pods    api.PodList
-	ctrl    api.ReplicationController
-}
-
-func (client *FakeKubeClient) ListPods(selector labels.Selector) (api.PodList, error) {
-	client.actions = append(client.actions, Action{action: "list-pods"})
-	return client.pods, nil
-}
-
-func (client *FakeKubeClient) GetPod(name string) (api.Pod, error) {
-	client.actions = append(client.actions, Action{action: "get-pod", value: name})
-	return api.Pod{}, nil
-}
-
-func (client *FakeKubeClient) DeletePod(name string) error {
-	client.actions = append(client.actions, Action{action: "delete-pod", value: name})
-	return nil
-}
-
-func (client *FakeKubeClient) CreatePod(pod api.Pod) (api.Pod, error) {
-	client.actions = append(client.actions, Action{action: "create-pod"})
-	return api.Pod{}, nil
-}
-
-func (client *FakeKubeClient) UpdatePod(pod api.Pod) (api.Pod, error) {
-	client.actions = append(client.actions, Action{action: "update-pod", value: pod.ID})
-	return api.Pod{}, nil
-}
-
-func (client *FakeKubeClient) GetReplicationController(name string) (api.ReplicationController, error) {
-	client.actions = append(client.actions, Action{action: "get-controller", value: name})
-	return client.ctrl, nil
-}
-
-func (client *FakeKubeClient) CreateReplicationController(controller api.ReplicationController) (api.ReplicationController, error) {
-	client.actions = append(client.actions, Action{action: "create-controller", value: controller})
-	return api.ReplicationController{}, nil
-}
-
-func (client *FakeKubeClient) UpdateReplicationController(controller api.ReplicationController) (api.ReplicationController, error) {
-	client.actions = append(client.actions, Action{action: "update-controller", value: controller})
-	return api.ReplicationController{}, nil
-}
-
-func (client *FakeKubeClient) DeleteReplicationController(controller string) error {
-	client.actions = append(client.actions, Action{action: "delete-controller", value: controller})
-	return nil
-}
-
-func (client *FakeKubeClient) GetService(name string) (api.Service, error) {
-	client.actions = append(client.actions, Action{action: "get-controller", value: name})
-	return api.Service{}, nil
-}
-
-func (client *FakeKubeClient) CreateService(controller api.Service) (api.Service, error) {
-	client.actions = append(client.actions, Action{action: "create-service", value: controller})
-	return api.Service{}, nil
-}
-
-func (client *FakeKubeClient) UpdateService(controller api.Service) (api.Service, error) {
-	client.actions = append(client.actions, Action{action: "update-service", value: controller})
-	return api.Service{}, nil
-}
-
-func (client *FakeKubeClient) DeleteService(controller string) error {
-	client.actions = append(client.actions, Action{action: "delete-service", value: controller})
-	return nil
-}
-
-func validateAction(expectedAction, actualAction Action, t *testing.T) {
-	if expectedAction != actualAction {
-		t.Errorf("Unexpected action: %#v, expected: %#v", actualAction, expectedAction)
+func validateAction(expectedAction, actualAction client.FakeAction, t *testing.T) {
+	if !reflect.DeepEqual(expectedAction, actualAction) {
+		t.Errorf("Unexpected Action: %#v, expected: %#v", actualAction, expectedAction)
 	}
 }
 
 func TestUpdateWithPods(t *testing.T) {
-	client := FakeKubeClient{
-		pods: api.PodList{
+	fakeClient := client.Fake{
+		PodsList: api.PodList{
 			Items: []api.Pod{
-				{JSONBase: api.JSONBase{ID: "pod-1"}},
-				{JSONBase: api.JSONBase{ID: "pod-2"}},
+				{ObjectMeta: api.ObjectMeta{Name: "pod-1"}},
+				{ObjectMeta: api.ObjectMeta{Name: "pod-2"}},
 			},
 		},
 	}
-	Update("foo", &client, 0)
-	if len(client.actions) != 4 {
-		t.Errorf("Unexpected action list %#v", client.actions)
+	Update(api.NewDefaultContext(), "foo", &fakeClient, 0, "")
+	if len(fakeClient.Actions) != 5 {
+		t.Fatalf("Unexpected action list %#v", fakeClient.Actions)
 	}
-	validateAction(Action{action: "get-controller", value: "foo"}, client.actions[0], t)
-	validateAction(Action{action: "list-pods"}, client.actions[1], t)
+	validateAction(client.FakeAction{Action: "get-controller", Value: "foo"}, fakeClient.Actions[0], t)
+	validateAction(client.FakeAction{Action: "list-pods"}, fakeClient.Actions[1], t)
 	// Update deletes the pods, it relies on the replication controller to replace them.
-	validateAction(Action{action: "delete-pod", value: "pod-1"}, client.actions[2], t)
-	validateAction(Action{action: "delete-pod", value: "pod-2"}, client.actions[3], t)
+	validateAction(client.FakeAction{Action: "delete-pod", Value: "pod-1"}, fakeClient.Actions[2], t)
+	validateAction(client.FakeAction{Action: "delete-pod", Value: "pod-2"}, fakeClient.Actions[3], t)
+	validateAction(client.FakeAction{Action: "list-pods"}, fakeClient.Actions[4], t)
 }
 
 func TestUpdateNoPods(t *testing.T) {
-	client := FakeKubeClient{}
-	Update("foo", &client, 0)
-	if len(client.actions) != 2 {
-		t.Errorf("Unexpected action list %#v", client.actions)
+	fakeClient := client.Fake{}
+	Update(api.NewDefaultContext(), "foo", &fakeClient, 0, "")
+	if len(fakeClient.Actions) != 2 {
+		t.Errorf("Unexpected action list %#v", fakeClient.Actions)
 	}
-	validateAction(Action{action: "get-controller", value: "foo"}, client.actions[0], t)
-	validateAction(Action{action: "list-pods"}, client.actions[1], t)
+	validateAction(client.FakeAction{Action: "get-controller", Value: "foo"}, fakeClient.Actions[0], t)
+	validateAction(client.FakeAction{Action: "list-pods"}, fakeClient.Actions[1], t)
+}
+
+func TestUpdateWithNewImage(t *testing.T) {
+	fakeClient := client.Fake{
+		PodsList: api.PodList{
+			Items: []api.Pod{
+				{ObjectMeta: api.ObjectMeta{Name: "pod-1"}},
+				{ObjectMeta: api.ObjectMeta{Name: "pod-2"}},
+			},
+		},
+		Ctrl: api.ReplicationController{
+			Spec: api.ReplicationControllerSpec{
+				Template: &api.PodTemplateSpec{
+					Spec: api.PodSpec{
+						Containers: []api.Container{
+							{Image: "fooImage:1"},
+						},
+					},
+				},
+			},
+		},
+	}
+	Update(api.NewDefaultContext(), "foo", &fakeClient, 0, "fooImage:2")
+	if len(fakeClient.Actions) != 6 {
+		t.Errorf("Unexpected action list %#v", fakeClient.Actions)
+	}
+	validateAction(client.FakeAction{Action: "get-controller", Value: "foo"}, fakeClient.Actions[0], t)
+
+	newCtrl := api.Scheme.CopyOrDie(&fakeClient.Ctrl).(*api.ReplicationController)
+	newCtrl.Spec.Template.Spec.Containers[0].Image = "fooImage:2"
+	validateAction(client.FakeAction{Action: "update-controller", Value: newCtrl}, fakeClient.Actions[1], t)
+
+	validateAction(client.FakeAction{Action: "list-pods"}, fakeClient.Actions[2], t)
+	// Update deletes the pods, it relies on the replication controller to replace them.
+	validateAction(client.FakeAction{Action: "delete-pod", Value: "pod-1"}, fakeClient.Actions[3], t)
+	validateAction(client.FakeAction{Action: "delete-pod", Value: "pod-2"}, fakeClient.Actions[4], t)
+	validateAction(client.FakeAction{Action: "list-pods"}, fakeClient.Actions[5], t)
 }
 
 func TestRunController(t *testing.T) {
-	fakeClient := FakeKubeClient{}
+	fakeClient := client.Fake{}
 	name := "name"
 	image := "foo/bar"
 	replicas := 3
-	RunController(image, name, replicas, &fakeClient, "8080:80", -1)
-	if len(fakeClient.actions) != 1 || fakeClient.actions[0].action != "create-controller" {
-		t.Errorf("Unexpected actions: %#v", fakeClient.actions)
+	RunController(api.NewDefaultContext(), image, name, replicas, &fakeClient, "8080:80", -1)
+	if len(fakeClient.Actions) != 1 || fakeClient.Actions[0].Action != "create-controller" {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
 	}
-	controller := fakeClient.actions[0].value.(api.ReplicationController)
-	if controller.ID != name ||
-		controller.DesiredState.Replicas != replicas ||
-		controller.DesiredState.PodTemplate.DesiredState.Manifest.Containers[0].Image != image {
+	controller := fakeClient.Actions[0].Value.(*api.ReplicationController)
+	if controller.Name != name ||
+		controller.Spec.Replicas != replicas ||
+		controller.Spec.Template.Spec.Containers[0].Image != image {
+		t.Errorf("Unexpected controller: %#v", controller)
+	}
+}
+
+func TestRunControllerWithWrongArgs(t *testing.T) {
+	fakeClient := client.Fake{}
+	name := "name"
+	image := "foo/bar"
+	replicas := 3
+	err := RunController(api.NewDefaultContext(), image, name, replicas, &fakeClient, "8080:", -1)
+	if err == nil {
+		t.Errorf("Unexpected non-error: %#v", fakeClient.Actions)
+	}
+	RunController(api.NewDefaultContext(), image, name, replicas, &fakeClient, "8080:80", -1)
+	if len(fakeClient.Actions) != 1 || fakeClient.Actions[0].Action != "create-controller" {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
+	}
+	controller := fakeClient.Actions[0].Value.(*api.ReplicationController)
+	if controller.Name != name ||
+		controller.Spec.Replicas != replicas ||
+		controller.Spec.Template.Spec.Containers[0].Image != image {
 		t.Errorf("Unexpected controller: %#v", controller)
 	}
 }
 
 func TestRunControllerWithService(t *testing.T) {
-	fakeClient := FakeKubeClient{}
+	fakeClient := client.Fake{}
 	name := "name"
 	image := "foo/bar"
 	replicas := 3
-	RunController(image, name, replicas, &fakeClient, "", 8000)
-	if len(fakeClient.actions) != 2 ||
-		fakeClient.actions[0].action != "create-controller" ||
-		fakeClient.actions[1].action != "create-service" {
-		t.Errorf("Unexpected actions: %#v", fakeClient.actions)
+	RunController(api.NewDefaultContext(), image, name, replicas, &fakeClient, "", 8000)
+	if len(fakeClient.Actions) != 2 ||
+		fakeClient.Actions[0].Action != "create-controller" ||
+		fakeClient.Actions[1].Action != "create-service" {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
 	}
-	controller := fakeClient.actions[0].value.(api.ReplicationController)
-	if controller.ID != name ||
-		controller.DesiredState.Replicas != replicas ||
-		controller.DesiredState.PodTemplate.DesiredState.Manifest.Containers[0].Image != image {
+	controller := fakeClient.Actions[0].Value.(*api.ReplicationController)
+	if controller.Name != name ||
+		controller.Spec.Replicas != replicas ||
+		controller.Spec.Template.Spec.Containers[0].Image != image {
 		t.Errorf("Unexpected controller: %#v", controller)
 	}
 }
 
 func TestStopController(t *testing.T) {
-	fakeClient := FakeKubeClient{}
+	fakeClient := client.Fake{}
 	name := "name"
-	StopController(name, &fakeClient)
-	if len(fakeClient.actions) != 2 {
-		t.Errorf("Unexpected actions: %#v", fakeClient.actions)
+	StopController(api.NewDefaultContext(), name, &fakeClient)
+	if len(fakeClient.Actions) != 2 {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
 	}
-	if fakeClient.actions[0].action != "get-controller" ||
-		fakeClient.actions[0].value.(string) != name {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[0])
+	if fakeClient.Actions[0].Action != "get-controller" ||
+		fakeClient.Actions[0].Value.(string) != name {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[0])
 	}
-	controller := fakeClient.actions[1].value.(api.ReplicationController)
-	if fakeClient.actions[1].action != "update-controller" ||
-		controller.DesiredState.Replicas != 0 {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[1])
+	controller := fakeClient.Actions[1].Value.(*api.ReplicationController)
+	if fakeClient.Actions[1].Action != "update-controller" ||
+		controller.Spec.Replicas != 0 {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[1])
 	}
 }
 
 func TestResizeController(t *testing.T) {
-	fakeClient := FakeKubeClient{}
+	fakeClient := client.Fake{}
 	name := "name"
 	replicas := 17
-	ResizeController(name, replicas, &fakeClient)
-	if len(fakeClient.actions) != 2 {
-		t.Errorf("Unexpected actions: %#v", fakeClient.actions)
+	ResizeController(api.NewDefaultContext(), name, replicas, &fakeClient)
+	if len(fakeClient.Actions) != 2 {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
 	}
-	if fakeClient.actions[0].action != "get-controller" ||
-		fakeClient.actions[0].value.(string) != name {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[0])
+	if fakeClient.Actions[0].Action != "get-controller" ||
+		fakeClient.Actions[0].Value.(string) != name {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[0])
 	}
-	controller := fakeClient.actions[1].value.(api.ReplicationController)
-	if fakeClient.actions[1].action != "update-controller" ||
-		controller.DesiredState.Replicas != 17 {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[1])
+	controller := fakeClient.Actions[1].Value.(*api.ReplicationController)
+	if fakeClient.Actions[1].Action != "update-controller" ||
+		controller.Spec.Replicas != 17 {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[1])
 	}
 }
 
 func TestCloudCfgDeleteController(t *testing.T) {
-	fakeClient := FakeKubeClient{}
+	fakeClient := client.Fake{}
 	name := "name"
-	err := DeleteController(name, &fakeClient)
-	expectNoError(t, err)
-	if len(fakeClient.actions) != 2 {
-		t.Errorf("Unexpected actions: %#v", fakeClient.actions)
+	err := DeleteController(api.NewDefaultContext(), name, &fakeClient)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
 	}
-	if fakeClient.actions[0].action != "get-controller" ||
-		fakeClient.actions[0].value.(string) != name {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[0])
+	if len(fakeClient.Actions) != 2 {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
 	}
-	if fakeClient.actions[1].action != "delete-controller" ||
-		fakeClient.actions[1].value.(string) != name {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[1])
+	if fakeClient.Actions[0].Action != "get-controller" ||
+		fakeClient.Actions[0].Value.(string) != name {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[0])
+	}
+	if fakeClient.Actions[1].Action != "delete-controller" ||
+		fakeClient.Actions[1].Value.(string) != name {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[1])
 	}
 }
 
 func TestCloudCfgDeleteControllerWithReplicas(t *testing.T) {
-	fakeClient := FakeKubeClient{
-		ctrl: api.ReplicationController{
-			DesiredState: api.ReplicationControllerState{
+	fakeClient := client.Fake{
+		Ctrl: api.ReplicationController{
+			Spec: api.ReplicationControllerSpec{
 				Replicas: 2,
 			},
 		},
 	}
 	name := "name"
-	err := DeleteController(name, &fakeClient)
-	if len(fakeClient.actions) != 1 {
-		t.Errorf("Unexpected actions: %#v", fakeClient.actions)
+	err := DeleteController(api.NewDefaultContext(), name, &fakeClient)
+	if len(fakeClient.Actions) != 1 {
+		t.Errorf("Unexpected actions: %#v", fakeClient.Actions)
 	}
-	if fakeClient.actions[0].action != "get-controller" ||
-		fakeClient.actions[0].value.(string) != name {
-		t.Errorf("Unexpected action: %#v", fakeClient.actions[0])
+	if fakeClient.Actions[0].Action != "get-controller" ||
+		fakeClient.Actions[0].Value.(string) != name {
+		t.Errorf("Unexpected Action: %#v", fakeClient.Actions[0])
 	}
 	if err == nil {
 		t.Errorf("Unexpected non-error.")
 	}
 }
 
-func TestLoadAuthInfo(t *testing.T) {
-	testAuthInfo := &client.AuthInfo{
-		User:     "TestUser",
-		Password: "TestPassword",
+func TestLoadNamespaceInfo(t *testing.T) {
+	loadNamespaceInfoTests := []struct {
+		nsData string
+		nsInfo *NamespaceInfo
+	}{
+		{
+			`{"Namespace":"test"}`,
+			&NamespaceInfo{Namespace: "test"},
+		},
+		{
+			"", nil,
+		},
+		{
+			"missing",
+			&NamespaceInfo{Namespace: "default"},
+		},
 	}
-	aifile, err := ioutil.TempFile("", "testAuthInfo")
-	if err != nil {
-		t.Error("Could not open temp file")
-	}
-	defer os.Remove(aifile.Name())
-	defer aifile.Close()
-
-	ai, err := LoadAuthInfo(aifile.Name())
-	if err == nil {
-		t.Error("LoadAuthInfo didn't fail on empty file")
-	}
-	data, err := json.Marshal(testAuthInfo)
-	if err != nil {
-		t.Fatal("Unexpected JSON marshal error")
-	}
-	_, err = aifile.Write(data)
-	if err != nil {
-		t.Fatal("Unexpected error in writing test file")
-	}
-	ai, err = LoadAuthInfo(aifile.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if *testAuthInfo != *ai {
-		t.Error("Test data and loaded data are not equal")
+	for _, loadNamespaceInfoTest := range loadNamespaceInfoTests {
+		tt := loadNamespaceInfoTest
+		nsfile, err := ioutil.TempFile("", "testNamespaceInfo")
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+		if tt.nsData != "missing" {
+			defer os.Remove(nsfile.Name())
+			defer nsfile.Close()
+			_, err := nsfile.WriteString(tt.nsData)
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+		} else {
+			nsfile.Close()
+			os.Remove(nsfile.Name())
+		}
+		nsInfo, err := LoadNamespaceInfo(nsfile.Name())
+		if len(tt.nsData) == 0 && tt.nsData != "missing" {
+			if err == nil {
+				t.Error("LoadNamespaceInfo didn't fail on an empty file")
+			}
+			continue
+		}
+		if tt.nsData != "missing" {
+			if err != nil {
+				t.Errorf("Unexpected error: %v, %v", tt.nsData, err)
+			}
+			if !reflect.DeepEqual(nsInfo, tt.nsInfo) {
+				t.Errorf("Expected %v, got %v", tt.nsInfo, nsInfo)
+			}
+		}
 	}
 }
 
-func validatePort(t *testing.T, p api.Port, external int, internal int) {
-	if p.HostPort != external || p.ContainerPort != internal {
-		t.Errorf("Unexpected port: %#v != (%d, %d)", p, external, internal)
+func TestLoadClientAuthInfoOrPrompt(t *testing.T) {
+	loadAuthInfoTests := []struct {
+		authData string
+		authInfo *clientauth.Info
+		r        io.Reader
+	}{
+		{
+			`{"user": "user", "password": "pass"}`,
+			&clientauth.Info{User: "user", Password: "pass"},
+			nil,
+		},
+		{
+			"", nil, nil,
+		},
+		{
+			"missing",
+			&clientauth.Info{User: "user", Password: "pass"},
+			bytes.NewBufferString("user\npass"),
+		},
+	}
+	for _, loadAuthInfoTest := range loadAuthInfoTests {
+		tt := loadAuthInfoTest
+		aifile, err := ioutil.TempFile("", "testAuthInfo")
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+		if tt.authData != "missing" {
+			defer os.Remove(aifile.Name())
+			defer aifile.Close()
+			_, err = aifile.WriteString(tt.authData)
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+		} else {
+			aifile.Close()
+			os.Remove(aifile.Name())
+		}
+		authInfo, err := LoadClientAuthInfoOrPrompt(aifile.Name(), tt.r)
+		if len(tt.authData) == 0 && tt.authData != "missing" {
+			if err == nil {
+				t.Error("LoadClientAuthInfoOrPrompt didn't fail on empty file")
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+		if !reflect.DeepEqual(authInfo, tt.authInfo) {
+			t.Errorf("Expected %v, got %v", tt.authInfo, authInfo)
+		}
 	}
 }
 
 func TestMakePorts(t *testing.T) {
-	ports := makePorts("8080:80,8081:8081,443:444")
-	if len(ports) != 3 {
-		t.Errorf("Unexpected ports: %#v", ports)
+	var successTestCases = []struct {
+		spec  string
+		ports []api.Port
+	}{
+		{
+			"8080:80,8081:8081,443:444",
+			[]api.Port{
+				{HostPort: 8080, ContainerPort: 80},
+				{HostPort: 8081, ContainerPort: 8081},
+				{HostPort: 443, ContainerPort: 444},
+			},
+		},
+		{
+			"",
+			[]api.Port{},
+		},
+	}
+	for _, tt := range successTestCases {
+		ports, err := portsFromString(tt.spec)
+		if !reflect.DeepEqual(ports, tt.ports) {
+			t.Errorf("Expected %#v, got %#v", tt.ports, ports)
+		}
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
 	}
 
-	validatePort(t, ports[0], 8080, 80)
-	validatePort(t, ports[1], 8081, 8081)
-	validatePort(t, ports[2], 443, 444)
+	var failTestCases = []struct {
+		spec string
+	}{
+		{"8080:"},
+		{":80"},
+		{":"},
+	}
+	for _, tt := range failTestCases {
+		_, err := portsFromString(tt.spec)
+		if err == nil {
+			t.Errorf("Unexpected non-error")
+		}
+	}
 }

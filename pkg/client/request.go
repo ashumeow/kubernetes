@@ -18,79 +18,98 @@ package client
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/golang/glog"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
+	watchjson "github.com/GoogleCloudPlatform/kubernetes/pkg/watch/json"
 )
 
-// Server contains info locating a kubernetes api server.
-// Example usage:
-// auth, err := LoadAuth(filename)
-// c := New(url, auth)
-// resp, err := c.Verb("GET").
-//	Path("pods").
-//	Selector("area=staging").
-//	Timeout(10*time.Second).
-//	Do()
-// list, ok := resp.(api.PodList)
+// specialParams lists parameters that are handled specially and which users of Request
+// are therefore not allowed to set manually.
+var specialParams = util.NewStringSet("sync", "timeout")
 
-// Verb begins a request with a verb (GET, POST, PUT, DELETE)
-func (c *Client) Verb(verb string) *Request {
-	return &Request{
-		verb:       verb,
-		c:          c,
-		path:       "/api/v1beta1",
-		sync:       c.Sync,
-		timeout:    c.Timeout,
-		pollPeriod: c.PollPeriod,
-	}
+// PollFunc is called when a server operation returns 202 accepted. The name of the
+// operation is extracted from the response and passed to this function. Return a
+// request to retrieve the result of the operation, or false for the second argument
+// if polling should end.
+type PollFunc func(name string) (*Request, bool)
+
+// HTTPClient is an interface for testing a request object.
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
 }
 
-// Post begins a POST request.
-func (c *Client) Post() *Request {
-	return c.Verb("POST")
+// UnexpectedStatusError is returned as an error if a response's body and HTTP code don't
+// make sense together.
+type UnexpectedStatusError struct {
+	Request  *http.Request
+	Response *http.Response
+	Body     string
 }
 
-// Put begins a PUT request.
-func (c *Client) Put() *Request {
-	return c.Verb("PUT")
+// Error returns a textual description of 'u'.
+func (u *UnexpectedStatusError) Error() string {
+	return fmt.Sprintf("request [%#v] failed (%d) %s: %s", u.Request, u.Response.StatusCode, u.Response.Status, u.Body)
 }
 
-// Get begins a GET request.
-func (c *Client) Get() *Request {
-	return c.Verb("GET")
+// RequestConstructionError is returned when there's an error assembling a request.
+type RequestConstructionError struct {
+	Err error
 }
 
-// Delete begins a DELETE request.
-func (c *Client) Delete() *Request {
-	return c.Verb("DELETE")
-}
-
-// PollFor makes a request to do a single poll of the completion of the given operation.
-func (c *Client) PollFor(operationID string) *Request {
-	return c.Get().Path("operations").Path(operationID).Sync(false).PollPeriod(0)
+// Error returns a textual description of 'r'.
+func (r *RequestConstructionError) Error() string {
+	return fmt.Sprintf("request construction error: '%v'", r.Err)
 }
 
 // Request allows for building up a request to a server in a chained fashion.
 // Any errors are stored until the end of your call, so you only have to
 // check once.
 type Request struct {
-	c          *Client
-	err        error
-	verb       string
-	path       string
-	body       io.Reader
-	selector   labels.Selector
-	timeout    time.Duration
-	sync       bool
-	pollPeriod time.Duration
+	// required
+	client  HTTPClient
+	verb    string
+	baseURL *url.URL
+	codec   runtime.Codec
+
+	// optional, will be invoked if the server returns a 202 to decide
+	// whether to poll.
+	poller PollFunc
+
+	// accessible via method setters
+	path     string
+	params   map[string]string
+	selector labels.Selector
+	sync     bool
+	timeout  time.Duration
+
+	// output
+	err  error
+	body io.Reader
+}
+
+// NewRequest creates a new request with the core attributes.
+func NewRequest(client HTTPClient, verb string, baseURL *url.URL, codec runtime.Codec) *Request {
+	return &Request{
+		client:  client,
+		verb:    verb,
+		baseURL: baseURL,
+		codec:   codec,
+
+		path: baseURL.Path,
+	}
 }
 
 // Path appends an item to the request path. You must call Path at least once.
@@ -102,12 +121,23 @@ func (r *Request) Path(item string) *Request {
 	return r
 }
 
-// Sync sets sync/async call status.
+// Sync sets sync/async call status by setting the "sync" parameter to "true"/"false".
 func (r *Request) Sync(sync bool) *Request {
 	if r.err != nil {
 		return r
 	}
 	r.sync = sync
+	return r
+}
+
+// Namespace applies the namespace scope to a request
+func (r *Request) Namespace(namespace string) *Request {
+	if r.err != nil {
+		return r
+	}
+	if len(namespace) > 0 {
+		return r.setParam("namespace", namespace)
+	}
 	return r
 }
 
@@ -120,25 +150,59 @@ func (r *Request) AbsPath(path string) *Request {
 	return r
 }
 
-// ParseSelector parses the given string as a resource label selector. Optional.
-func (r *Request) ParseSelector(item string) *Request {
+// ParseSelectorParam parses the given string as a resource label selector.
+// This is a convenience function so you don't have to first check that it's a
+// validly formatted selector.
+func (r *Request) ParseSelectorParam(paramName, item string) *Request {
 	if r.err != nil {
 		return r
 	}
-	r.selector, r.err = labels.ParseSelector(item)
-	return r
+	sel, err := labels.ParseSelector(item)
+	if err != nil {
+		r.err = err
+		return r
+	}
+	return r.setParam(paramName, sel.String())
 }
 
-// Selector makes the request use the given selector.
-func (r *Request) Selector(s labels.Selector) *Request {
+// SelectorParam adds the given selector as a query parameter with the name paramName.
+func (r *Request) SelectorParam(paramName string, s labels.Selector) *Request {
 	if r.err != nil {
 		return r
 	}
-	r.selector = s
+	return r.setParam(paramName, s.String())
+}
+
+// UintParam creates a query parameter with the given value.
+func (r *Request) UintParam(paramName string, u uint64) *Request {
+	if r.err != nil {
+		return r
+	}
+	return r.setParam(paramName, strconv.FormatUint(u, 10))
+}
+
+// Param creates a query parameter with the given string value.
+func (r *Request) Param(paramName, s string) *Request {
+	if r.err != nil {
+		return r
+	}
+	return r.setParam(paramName, s)
+}
+
+func (r *Request) setParam(paramName, value string) *Request {
+	if specialParams.Has(paramName) {
+		r.err = fmt.Errorf("must set %v through the corresponding function, not directly.", paramName)
+		return r
+	}
+	if r.params == nil {
+		r.params = make(map[string]string)
+	}
+	r.params[paramName] = value
 	return r
 }
 
-// Timeout makes the request use the given duration as a timeout. Optional.
+// Timeout makes the request use the given duration as a timeout. Sets the "timeout"
+// parameter. Ignored if sync=false.
 func (r *Request) Timeout(d time.Duration) *Request {
 	if r.err != nil {
 		return r
@@ -150,7 +214,9 @@ func (r *Request) Timeout(d time.Duration) *Request {
 // Body makes the request use obj as the body. Optional.
 // If obj is a string, try to read a file of that name.
 // If obj is a []byte, send it directly.
-// Otherwise, assume obj is an api type and marshall it correctly.
+// If obj is an io.Reader, use it directly.
+// If obj is a runtime.Object, marshal it correctly.
+// Otherwise, set an error.
 func (r *Request) Body(obj interface{}) *Request {
 	if r.err != nil {
 		return r
@@ -166,75 +232,212 @@ func (r *Request) Body(obj interface{}) *Request {
 	case []byte:
 		r.body = bytes.NewBuffer(t)
 	case io.Reader:
-		r.body = obj.(io.Reader)
-	default:
-		data, err := api.Encode(obj)
+		r.body = t
+	case runtime.Object:
+		data, err := r.codec.Encode(t)
 		if err != nil {
 			r.err = err
 			return r
 		}
 		r.body = bytes.NewBuffer(data)
+	default:
+		r.err = fmt.Errorf("unknown type used for body: %#v", obj)
 	}
 	return r
 }
 
-// PollPeriod sets the poll period.
-// If the server sends back a "working" status message, then repeatedly poll the server
-// to see if the operation has completed yet, waiting 'd' between each poll.
-// If you want to handle the "working" status yourself (it'll be delivered as StatusErr),
-// set d to 0 to turn off this behavior.
-func (r *Request) PollPeriod(d time.Duration) *Request {
+// NoPoll indicates a server "working" response should be returned as an error
+func (r *Request) NoPoll() *Request {
+	return r.Poller(nil)
+}
+
+// Poller indicates this request should use the specified poll function to determine whether
+// a server "working" response should be retried. The poller is responsible for waiting or
+// outputting messages to the client.
+func (r *Request) Poller(poller PollFunc) *Request {
 	if r.err != nil {
 		return r
 	}
-	r.pollPeriod = d
+	r.poller = poller
 	return r
 }
 
-// Do formats and executes the request. Returns the API object received, or an error.
+func (r *Request) finalURL() string {
+	finalURL := *r.baseURL
+	finalURL.Path = r.path
+	query := url.Values{}
+	for key, value := range r.params {
+		query.Add(key, value)
+	}
+
+	// sync and timeout are handled specially here, to allow setting them
+	// in any order.
+	if r.sync {
+		query.Add("sync", "true")
+		if r.timeout != 0 {
+			query.Add("timeout", r.timeout.String())
+		}
+	}
+	finalURL.RawQuery = query.Encode()
+	return finalURL.String()
+}
+
+// Watch attempts to begin watching the requested location.
+// Returns a watch.Interface, or an error.
+func (r *Request) Watch() (watch.Interface, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	req, err := http.NewRequest(r.verb, r.finalURL(), r.body)
+	if err != nil {
+		return nil, err
+	}
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		var body []byte
+		if resp.Body != nil {
+			body, _ = ioutil.ReadAll(resp.Body)
+		}
+		return nil, fmt.Errorf("for request '%v', got status: %v\nbody: %v", req.URL, resp.StatusCode, string(body))
+	}
+	return watch.NewStreamWatcher(watchjson.NewDecoder(resp.Body, r.codec)), nil
+}
+
+// Stream formats and executes the request, and offers streaming of the response.
+// Returns io.ReadCloser which could be used for streaming of the response, or an error
+func (r *Request) Stream() (io.ReadCloser, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	req, err := http.NewRequest(r.verb, r.finalURL(), nil)
+	if err != nil {
+		return nil, err
+	}
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// Do formats and executes the request. Returns a Result object for easy response
+// processing. Handles polling the server in the event a continuation was sent.
+//
+// Error type:
+//  * If the request can't be constructed, or an error happened earlier while building its
+//    arguments: *RequestConstructionError
+//  * If the server responds with a status: *errors.StatusError or *errors.UnexpectedObjectError
+//  * If the status code and body don't make sense together: *UnexpectedStatusError
+//  * http.Client.Do errors are returned directly.
 func (r *Request) Do() Result {
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+
 	for {
 		if r.err != nil {
-			return Result{err: r.err}
+			return Result{err: &RequestConstructionError{r.err}}
 		}
-		finalURL := r.c.host + r.path
-		query := url.Values{}
-		if r.selector != nil {
-			query.Add("labels", r.selector.String())
+
+		req, err := http.NewRequest(r.verb, r.finalURL(), r.body)
+		if err != nil {
+			return Result{err: &RequestConstructionError{err}}
 		}
-		if r.sync {
-			query.Add("sync", "true")
-			if r.timeout != 0 {
-				query.Add("timeout", r.timeout.String())
-			}
-		}
-		finalURL += "?" + query.Encode()
-		req, err := http.NewRequest(r.verb, finalURL, r.body)
+
+		resp, err := client.Do(req)
 		if err != nil {
 			return Result{err: err}
 		}
-		respBody, err := r.c.doRequest(req)
-		if err != nil {
-			if statusErr, ok := err.(*StatusErr); ok {
-				if statusErr.Status.Status == api.StatusWorking && r.pollPeriod != 0 {
-					glog.Infof("Waiting for completion of /operations/%s", statusErr.Status.Details)
-					time.Sleep(r.pollPeriod)
-					// Make a poll request
-					pollOp := r.c.PollFor(statusErr.Status.Details).PollPeriod(r.pollPeriod)
-					// Could also say "return r.Do()" but this way doesn't grow the callstack.
-					r = pollOp
-					continue
-				}
+
+		respBody, created, err := r.transformResponse(resp, req)
+		if poll, ok := r.shouldPoll(err); ok {
+			r = poll
+			continue
+		}
+
+		return Result{respBody, created, err, r.codec}
+	}
+}
+
+// shouldPoll checks the server error for an incomplete operation
+// and if found returns a request that would check the response.
+// If no polling is necessary or possible, it will return false.
+func (r *Request) shouldPoll(err error) (*Request, bool) {
+	if err == nil || r.poller == nil {
+		return nil, false
+	}
+	apistatus, ok := err.(APIStatus)
+	if !ok {
+		return nil, false
+	}
+	status := apistatus.Status()
+	if status.Status != api.StatusWorking {
+		return nil, false
+	}
+	if status.Details == nil || len(status.Details.ID) == 0 {
+		return nil, false
+	}
+	return r.poller(status.Details.ID)
+}
+
+// transformResponse converts an API response into a structured API object.
+func (r *Request) transformResponse(resp *http.Response, req *http.Request) ([]byte, bool, error) {
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Did the server give us a status response?
+	isStatusResponse := false
+	var status api.Status
+	if err := r.codec.DecodeInto(body, &status); err == nil && status.Status != "" {
+		isStatusResponse = true
+	}
+
+	switch {
+	case resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent:
+		if !isStatusResponse {
+			return nil, false, &UnexpectedStatusError{
+				Request:  req,
+				Response: resp,
+				Body:     string(body),
 			}
 		}
-		return Result{respBody, err}
+		return nil, false, errors.FromObject(&status)
 	}
+
+	// If the server gave us a status back, look at what it was.
+	if isStatusResponse && status.Status != api.StatusSuccess {
+		// "Working" requests need to be handled specially.
+		// "Failed" requests are clearly just an error and it makes sense to return them as such.
+		return nil, false, errors.FromObject(&status)
+	}
+
+	created := resp.StatusCode == http.StatusCreated
+	return body, created, err
 }
 
 // Result contains the result of calling Request.Do().
 type Result struct {
-	body []byte
-	err  error
+	body    []byte
+	created bool
+	err     error
+
+	codec runtime.Codec
 }
 
 // Raw returns the raw result.
@@ -243,22 +446,30 @@ func (r Result) Raw() ([]byte, error) {
 }
 
 // Get returns the result as an object.
-func (r Result) Get() (interface{}, error) {
+func (r Result) Get() (runtime.Object, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	return api.Decode(r.body)
+	return r.codec.Decode(r.body)
 }
 
-// Into stores the result into obj, if possible..
-func (r Result) Into(obj interface{}) error {
+// Into stores the result into obj, if possible.
+func (r Result) Into(obj runtime.Object) error {
 	if r.err != nil {
 		return r.err
 	}
-	return api.DecodeInto(r.body, obj)
+	return r.codec.DecodeInto(r.body, obj)
 }
 
-// Returns the error executing the request, nil if no error occurred.
+// WasCreated updates the provided bool pointer to whether the server returned
+// 201 created or a different response.
+func (r Result) WasCreated(wasCreated *bool) Result {
+	*wasCreated = r.created
+	return r
+}
+
+// Error returns the error executing the request, nil if no error occurred.
+// See the Request.Do() comment for what errors you might get.
 func (r Result) Error() error {
 	return r.err
 }

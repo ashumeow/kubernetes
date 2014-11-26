@@ -23,6 +23,7 @@ import (
 
 func TestStringSet(t *testing.T) {
 	s := StringSet{}
+	s2 := StringSet{}
 	if len(s) != 0 {
 		t.Errorf("Expected len=0: %d", len(s))
 	}
@@ -40,6 +41,21 @@ func TestStringSet(t *testing.T) {
 	s.Delete("a")
 	if s.Has("a") {
 		t.Errorf("Unexpected contents: %#v", s)
+	}
+	s.Insert("a")
+	if s.HasAll("a", "b", "d") {
+		t.Errorf("Unexpected contents: %#v", s)
+	}
+	if !s.HasAll("a", "b") {
+		t.Errorf("Missing contents: %#v", s)
+	}
+	s2.Insert("a", "b", "d")
+	if s.IsSuperset(s2) {
+		t.Errorf("Unexpected contents: %#v", s)
+	}
+	s2.Delete("d")
+	if !s.IsSuperset(s2) {
+		t.Errorf("Missing contents: %#v", s)
 	}
 }
 

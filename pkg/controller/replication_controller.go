@@ -17,40 +17,34 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/json"
-	"fmt"
-	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/coreos/go-etcd/etcd"
 	"github.com/golang/glog"
 )
 
-// ReplicationManager is responsible for synchronizing ReplicationController objects stored in etcd
-// with actual running pods.
-// TODO: Remove the etcd dependency and re-factor in terms of a generic watch interface
+// ReplicationManager is responsible for synchronizing ReplicationController objects stored
+// in the system with actual running pods.
 type ReplicationManager struct {
-	etcdClient tools.EtcdClient
 	kubeClient client.Interface
 	podControl PodControlInterface
 	syncTime   <-chan time.Time
 
 	// To allow injection of syncReplicationController for testing.
-	syncHandler func(controllerSpec api.ReplicationController) error
+	syncHandler func(controller api.ReplicationController) error
 }
 
 // PodControlInterface is an interface that knows how to add or delete pods
 // created as an interface to allow testing.
 type PodControlInterface interface {
 	// createReplica creates new replicated pods according to the spec.
-	createReplica(controllerSpec api.ReplicationController)
+	createReplica(namespace string, controller api.ReplicationController)
 	// deletePod deletes the pod identified by podID.
-	deletePod(podID string) error
+	deletePod(namespace string, podID string) error
 }
 
 // RealPodControl is the default implementation of PodControllerInterface.
@@ -58,162 +52,161 @@ type RealPodControl struct {
 	kubeClient client.Interface
 }
 
-func (r RealPodControl) createReplica(controllerSpec api.ReplicationController) {
-	labels := controllerSpec.DesiredState.PodTemplate.Labels
-	if labels != nil {
-		labels["replicationController"] = controllerSpec.ID
+func (r RealPodControl) createReplica(namespace string, controller api.ReplicationController) {
+	desiredLabels := make(labels.Set)
+	for k, v := range controller.Spec.Template.Labels {
+		desiredLabels[k] = v
 	}
-	pod := api.Pod{
-		JSONBase: api.JSONBase{
-			ID: fmt.Sprintf("%08x", rand.Uint32()),
+	pod := &api.Pod{
+		ObjectMeta: api.ObjectMeta{
+			Labels: desiredLabels,
 		},
-		DesiredState: controllerSpec.DesiredState.PodTemplate.DesiredState,
-		Labels:       controllerSpec.DesiredState.PodTemplate.Labels,
 	}
-	_, err := r.kubeClient.CreatePod(pod)
-	if err != nil {
-		glog.Errorf("%#v\n", err)
+	if err := api.Scheme.Convert(&controller.Spec.Template.Spec, &pod.Spec); err != nil {
+		glog.Errorf("Unable to convert pod template: %v", err)
+		return
+	}
+	if labels.Set(pod.Labels).AsSelector().Empty() {
+		glog.Errorf("Unable to create pod replica, no labels")
+		return
+	}
+	if _, err := r.kubeClient.Pods(namespace).Create(pod); err != nil {
+		glog.Errorf("Unable to create pod replica: %v", err)
 	}
 }
 
-func (r RealPodControl) deletePod(podID string) error {
-	return r.kubeClient.DeletePod(podID)
+func (r RealPodControl) deletePod(namespace, podID string) error {
+	return r.kubeClient.Pods(namespace).Delete(podID)
 }
 
-// MakeReplicationManager craetes a new ReplicationManager.
-func MakeReplicationManager(etcdClient tools.EtcdClient, kubeClient client.Interface) *ReplicationManager {
+// NewReplicationManager creates a new ReplicationManager.
+func NewReplicationManager(kubeClient client.Interface) *ReplicationManager {
 	rm := &ReplicationManager{
 		kubeClient: kubeClient,
-		etcdClient: etcdClient,
 		podControl: RealPodControl{
 			kubeClient: kubeClient,
 		},
 	}
-	rm.syncHandler = func(controllerSpec api.ReplicationController) error {
-		return rm.syncReplicationController(controllerSpec)
-	}
+	rm.syncHandler = rm.syncReplicationController
 	return rm
 }
 
 // Run begins watching and syncing.
 func (rm *ReplicationManager) Run(period time.Duration) {
 	rm.syncTime = time.Tick(period)
-	go util.Forever(func() { rm.watchControllers() }, period)
+	resourceVersion := ""
+	go util.Forever(func() { rm.watchControllers(&resourceVersion) }, period)
 }
 
-func (rm *ReplicationManager) watchControllers() {
-	watchChannel := make(chan *etcd.Response)
-	stop := make(chan bool)
-	defer func() {
-		// Ensure that the call to watch ends.
-		close(stop)
-	}()
-	go func() {
-		defer util.HandleCrash()
-		_, err := rm.etcdClient.Watch("/registry/controllers", 0, true, watchChannel, stop)
-		if err == etcd.ErrWatchStoppedByUser {
-			close(watchChannel)
-		} else {
-			glog.Errorf("etcd.Watch stopped unexpectedly: %v (%#v)", err, err)
-		}
-	}()
+// resourceVersion is a pointer to the resource version to use/update.
+func (rm *ReplicationManager) watchControllers(resourceVersion *string) {
+	watching, err := rm.kubeClient.ReplicationControllers(api.NamespaceAll).Watch(
+		labels.Everything(),
+		labels.Everything(),
+		*resourceVersion,
+	)
+	if err != nil {
+		glog.Errorf("Unexpected failure to watch: %v", err)
+		time.Sleep(5 * time.Second)
+		return
+	}
 
 	for {
 		select {
 		case <-rm.syncTime:
 			rm.synchronize()
-		case watchResponse, open := <-watchChannel:
-			if !open || watchResponse == nil {
+		case event, open := <-watching.ResultChan():
+			if !open {
 				// watchChannel has been closed, or something else went
 				// wrong with our etcd watch call. Let the util.Forever()
 				// that called us call us again.
 				return
 			}
-			glog.Infof("Got watch: %#v", watchResponse)
-			controller, err := rm.handleWatchResponse(watchResponse)
-			if err != nil {
-				glog.Errorf("Error handling data: %#v, %#v", err, watchResponse)
+			glog.V(4).Infof("Got watch: %#v", event)
+			rc, ok := event.Object.(*api.ReplicationController)
+			if !ok {
+				glog.Errorf("unexpected object: %#v", event.Object)
 				continue
 			}
-			rm.syncHandler(*controller)
+			// If we get disconnected, start where we left off.
+			*resourceVersion = rc.ResourceVersion
+			// Sync even if this is a deletion event, to ensure that we leave
+			// it in the desired state.
+			glog.V(4).Infof("About to sync from watch: %v", rc.Name)
+			if err := rm.syncHandler(*rc); err != nil {
+				glog.Errorf("unexpected sync. error: %v", err)
+			}
 		}
 	}
-}
-
-func (rm *ReplicationManager) handleWatchResponse(response *etcd.Response) (*api.ReplicationController, error) {
-	if response.Action == "set" {
-		if response.Node != nil {
-			var controllerSpec api.ReplicationController
-			err := json.Unmarshal([]byte(response.Node.Value), &controllerSpec)
-			if err != nil {
-				return nil, err
-			}
-			return &controllerSpec, nil
-		}
-		return nil, fmt.Errorf("response node is null %#v", response)
-	} else if response.Action == "delete" {
-		// Ensure that the final state of a replication controller is applied before it is deleted.
-		// Otherwise, a replication controller could be modified and then deleted (for example, from 3 to 0
-		// replicas), and it would be non-deterministic which of its pods continued to exist.
-		if response.PrevNode != nil {
-			var controllerSpec api.ReplicationController
-			if err := json.Unmarshal([]byte(response.PrevNode.Value), &controllerSpec); err != nil {
-				return nil, err
-			}
-			return &controllerSpec, nil
-		}
-		return nil, fmt.Errorf("previous node is null %#v", response)
-	}
-
-	return nil, nil
 }
 
 func (rm *ReplicationManager) filterActivePods(pods []api.Pod) []api.Pod {
 	var result []api.Pod
 	for _, value := range pods {
-		if api.PodStopped != value.CurrentState.Status {
+		if api.PodSucceeded != value.Status.Phase &&
+			api.PodFailed != value.Status.Phase {
 			result = append(result, value)
 		}
 	}
 	return result
 }
 
-func (rm *ReplicationManager) syncReplicationController(controllerSpec api.ReplicationController) error {
-	s := labels.Set(controllerSpec.DesiredState.ReplicaSelector).AsSelector()
-	podList, err := rm.kubeClient.ListPods(s)
+func (rm *ReplicationManager) syncReplicationController(controller api.ReplicationController) error {
+	s := labels.Set(controller.Spec.Selector).AsSelector()
+	podList, err := rm.kubeClient.Pods(controller.Namespace).List(s)
 	if err != nil {
 		return err
 	}
 	filteredList := rm.filterActivePods(podList.Items)
-	diff := len(filteredList) - controllerSpec.DesiredState.Replicas
-	glog.Infof("%#v", filteredList)
+	diff := len(filteredList) - controller.Spec.Replicas
 	if diff < 0 {
 		diff *= -1
-		glog.Infof("Too few replicas, creating %d\n", diff)
+		wait := sync.WaitGroup{}
+		wait.Add(diff)
+		glog.V(2).Infof("Too few replicas, creating %d\n", diff)
 		for i := 0; i < diff; i++ {
-			rm.podControl.createReplica(controllerSpec)
+			go func() {
+				defer wait.Done()
+				rm.podControl.createReplica(controller.Namespace, controller)
+			}()
 		}
+		wait.Wait()
 	} else if diff > 0 {
-		glog.Info("Too many replicas, deleting")
+		glog.V(2).Infof("Too many replicas, deleting %d\n", diff)
+		wait := sync.WaitGroup{}
+		wait.Add(diff)
 		for i := 0; i < diff; i++ {
-			rm.podControl.deletePod(filteredList[i].ID)
+			go func(ix int) {
+				defer wait.Done()
+				rm.podControl.deletePod(controller.Namespace, filteredList[ix].Name)
+			}(i)
 		}
+		wait.Wait()
 	}
 	return nil
 }
 
 func (rm *ReplicationManager) synchronize() {
-	var controllerSpecs []api.ReplicationController
-	helper := tools.EtcdHelper{rm.etcdClient}
-	err := helper.ExtractList("/registry/controllers", &controllerSpecs)
+	// TODO: remove this method completely and rely on the watch.
+	// Add resource version tracking to watch to make this work.
+	var controllers []api.ReplicationController
+	list, err := rm.kubeClient.ReplicationControllers(api.NamespaceAll).List(labels.Everything())
 	if err != nil {
 		glog.Errorf("Synchronization error: %v (%#v)", err, err)
 		return
 	}
-	for _, controllerSpec := range controllerSpecs {
-		err = rm.syncHandler(controllerSpec)
-		if err != nil {
-			glog.Errorf("Error synchronizing: %#v", err)
-		}
+	controllers = list.Items
+	wg := sync.WaitGroup{}
+	wg.Add(len(controllers))
+	for ix := range controllers {
+		go func(ix int) {
+			defer wg.Done()
+			glog.V(4).Infof("periodic sync of %v", controllers[ix].Name)
+			err := rm.syncHandler(controllers[ix])
+			if err != nil {
+				glog.Errorf("Error synchronizing: %v", err)
+			}
+		}(ix)
 	}
+	wg.Wait()
 }

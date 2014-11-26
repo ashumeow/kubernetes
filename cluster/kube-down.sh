@@ -16,40 +16,18 @@
 
 # Tear down a Kubernetes cluster.
 
-# exit on any error
-set -e
+set -o errexit
+set -o nounset
+set -o pipefail
 
-source $(dirname $0)/util.sh
+KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+source "${KUBE_ROOT}/cluster/kube-env.sh"
+source "${KUBE_ROOT}/cluster/${KUBERNETES_PROVIDER}/util.sh"
 
-# Detect the project into $PROJECT
-detect-project
+echo "Bringing down cluster using provider: $KUBERNETES_PROVIDER"
 
-echo "Bringing down cluster"
-gcutil deletefirewall  \
-  --project ${PROJECT} \
-  --norespect_terminal_width \
-  --force \
-  ${MASTER_NAME}-https &
+verify-prereqs
+teardown-monitoring
+kube-down
 
-gcutil deleteinstance \
-  --project ${PROJECT} \
-  --norespect_terminal_width \
-  --force \
-  --delete_boot_pd \
-  --zone ${ZONE} \
-  ${MASTER_NAME} &
-
-gcutil deleteinstance \
-  --project ${PROJECT} \
-  --norespect_terminal_width \
-  --force \
-  --delete_boot_pd \
-  --zone ${ZONE} \
-  ${MINION_NAMES[*]} &
-
-gcutil deleteroute  \
-  --project ${PROJECT} \
-  --force \
-  ${MINION_NAMES[*]} &
-
-wait
+echo "Done"

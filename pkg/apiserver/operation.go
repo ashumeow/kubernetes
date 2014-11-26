@@ -17,6 +17,7 @@ limitations under the License.
 package apiserver
 
 import (
+	"net/http"
 	"sort"
 	"strconv"
 	"sync"
@@ -24,17 +25,52 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 )
 
+type OperationHandler struct {
+	ops   *Operations
+	codec runtime.Codec
+}
+
+func (h *OperationHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	parts := splitPath(req.URL.Path)
+	if len(parts) > 1 || req.Method != "GET" {
+		notFound(w, req)
+		return
+	}
+	if len(parts) == 0 {
+		// List outstanding operations.
+		list := h.ops.List()
+		writeJSON(http.StatusOK, h.codec, list, w)
+		return
+	}
+
+	op := h.ops.Get(parts[0])
+	if op == nil {
+		notFound(w, req)
+		return
+	}
+
+	result, complete := op.StatusOrResult()
+	obj := result.Object
+	if complete {
+		writeJSON(http.StatusOK, h.codec, obj, w)
+	} else {
+		writeJSON(http.StatusAccepted, h.codec, obj, w)
+	}
+}
+
 // Operation represents an ongoing action which the server is performing.
 type Operation struct {
-	ID       string
-	result   interface{}
-	awaiting <-chan interface{}
-	finished *time.Time
-	lock     sync.Mutex
-	notify   chan bool
+	ID        string
+	result    RESTResult
+	onReceive func(RESTResult)
+	awaiting  <-chan RESTResult
+	finished  *time.Time
+	lock      sync.Mutex
+	notify    chan struct{}
 }
 
 // Operations tracks all the ongoing operations.
@@ -56,28 +92,30 @@ func NewOperations() *Operations {
 	return ops
 }
 
-// NewOperation adds a new operation. It is lock-free.
-func (ops *Operations) NewOperation(from <-chan interface{}) *Operation {
+// NewOperation adds a new operation. It is lock-free. 'onReceive' will be called
+// with the value read from 'from', when it is read.
+func (ops *Operations) NewOperation(from <-chan RESTResult, onReceive func(RESTResult)) *Operation {
 	id := atomic.AddInt64(&ops.lastID, 1)
 	op := &Operation{
-		ID:       strconv.FormatInt(id, 10),
-		awaiting: from,
-		notify:   make(chan bool, 1),
+		ID:        strconv.FormatInt(id, 10),
+		awaiting:  from,
+		onReceive: onReceive,
+		notify:    make(chan struct{}),
 	}
 	go op.wait()
 	go ops.insert(op)
 	return op
 }
 
-// Inserts op into the ops map.
+// insert inserts op into the ops map.
 func (ops *Operations) insert(op *Operation) {
 	ops.lock.Lock()
 	defer ops.lock.Unlock()
 	ops.ops[op.ID] = op
 }
 
-// List operations for an API client.
-func (ops *Operations) List() api.ServerOpList {
+// List lists operations for an API client.
+func (ops *Operations) List() *api.ServerOpList {
 	ops.lock.Lock()
 	defer ops.lock.Unlock()
 
@@ -86,21 +124,21 @@ func (ops *Operations) List() api.ServerOpList {
 		ids = append(ids, id)
 	}
 	sort.StringSlice(ids).Sort()
-	ol := api.ServerOpList{}
+	ol := &api.ServerOpList{}
 	for _, id := range ids {
-		ol.Items = append(ol.Items, api.ServerOp{JSONBase: api.JSONBase{ID: id}})
+		ol.Items = append(ol.Items, api.ServerOp{ObjectMeta: api.ObjectMeta{Name: id}})
 	}
 	return ol
 }
 
-// Get returns the operation with the given ID, or nil
+// Get returns the operation with the given ID, or nil.
 func (ops *Operations) Get(id string) *Operation {
 	ops.lock.Lock()
 	defer ops.lock.Unlock()
 	return ops.ops[id]
 }
 
-// Garbage collect operations that have finished longer than maxAge ago.
+// expire garbage collect operations that have finished longer than maxAge ago.
 func (ops *Operations) expire(maxAge time.Duration) {
 	ops.lock.Lock()
 	defer ops.lock.Unlock()
@@ -114,9 +152,9 @@ func (ops *Operations) expire(maxAge time.Duration) {
 	ops.ops = keep
 }
 
-// Waits forever for the operation to complete; call via go when
+// wait waits forever for the operation to complete; call via go when
 // the operation is created. Sets op.finished when the operation
-// does complete, and sends on the notify channel, in case there
+// does complete, and closes the notify channel, in case there
 // are any WaitFor() calls in progress.
 // Does not keep op locked while waiting.
 func (op *Operation) wait() {
@@ -125,10 +163,13 @@ func (op *Operation) wait() {
 
 	op.lock.Lock()
 	defer op.lock.Unlock()
+	if op.onReceive != nil {
+		op.onReceive(result)
+	}
 	op.result = result
 	finished := time.Now()
 	op.finished = &finished
-	op.notify <- true
+	close(op.notify)
 }
 
 // WaitFor waits for the specified duration, or until the operation finishes,
@@ -137,13 +178,10 @@ func (op *Operation) WaitFor(timeout time.Duration) {
 	select {
 	case <-time.After(timeout):
 	case <-op.notify:
-		// Re-send on this channel in case there are others
-		// waiting for notification.
-		op.notify <- true
 	}
 }
 
-// Returns true if this operation finished before limitTime.
+// expired returns true if this operation finished before limitTime.
 func (op *Operation) expired(limitTime time.Time) bool {
 	op.lock.Lock()
 	defer op.lock.Unlock()
@@ -155,15 +193,16 @@ func (op *Operation) expired(limitTime time.Time) bool {
 
 // StatusOrResult returns status information or the result of the operation if it is complete,
 // with a bool indicating true in the latter case.
-func (op *Operation) StatusOrResult() (description interface{}, finished bool) {
+func (op *Operation) StatusOrResult() (description RESTResult, finished bool) {
 	op.lock.Lock()
 	defer op.lock.Unlock()
 
 	if op.finished == nil {
-		return api.Status{
+		return RESTResult{Object: &api.Status{
 			Status:  api.StatusWorking,
-			Details: op.ID,
-		}, false
+			Reason:  api.StatusReasonWorking,
+			Details: &api.StatusDetails{ID: op.ID, Kind: "operation"},
+		}}, false
 	}
 	return op.result, true
 }

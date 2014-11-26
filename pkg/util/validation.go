@@ -22,7 +22,7 @@ import (
 
 const dnsLabelFmt string = "[a-z0-9]([-a-z0-9]*[a-z0-9])?"
 
-var dnsLabelRegexp *regexp.Regexp = regexp.MustCompile("^" + dnsLabelFmt + "$")
+var dnsLabelRegexp = regexp.MustCompile("^" + dnsLabelFmt + "$")
 
 const dnsLabelMaxLength int = 63
 
@@ -34,7 +34,7 @@ func IsDNSLabel(value string) bool {
 
 const dnsSubdomainFmt string = dnsLabelFmt + "(\\." + dnsLabelFmt + ")*"
 
-var dnsSubdomainRegexp *regexp.Regexp = regexp.MustCompile("^" + dnsSubdomainFmt + "$")
+var dnsSubdomainRegexp = regexp.MustCompile("^" + dnsSubdomainFmt + "$")
 
 const dnsSubdomainMaxLength int = 253
 
@@ -46,7 +46,7 @@ func IsDNSSubdomain(value string) bool {
 
 const cIdentifierFmt string = "[A-Za-z_][A-Za-z0-9_]*"
 
-var cIdentifierRegexp *regexp.Regexp = regexp.MustCompile("^" + cIdentifierFmt + "$")
+var cIdentifierRegexp = regexp.MustCompile("^" + cIdentifierFmt + "$")
 
 // IsCIdentifier tests for a string that conforms the definition of an identifier
 // in C. This checks the format, but not the length.
@@ -57,4 +57,14 @@ func IsCIdentifier(value string) bool {
 // IsValidPortNum tests that the argument is a valid, non-zero port number.
 func IsValidPortNum(port int) bool {
 	return 0 < port && port < 65536
+}
+
+const dns952IdentifierFmt string = "[a-z]([-a-z0-9]*[a-z0-9])?"
+
+var dns952Regexp = regexp.MustCompile("^" + dns952IdentifierFmt + "$")
+
+const dns952MaxLength = 24
+
+func IsDNS952Label(value string) bool {
+	return len(value) <= dns952MaxLength && dns952Regexp.MatchString(value)
 }

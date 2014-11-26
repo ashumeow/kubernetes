@@ -16,22 +16,12 @@
 
 # This script sets up a go workspace locally and builds all go components.
 
-set -e
+set -o errexit
+set -o nounset
+set -o pipefail
 
-# Update the version.
-$(dirname $0)/version-gen.sh
+KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+source "${KUBE_ROOT}/hack/lib/init.sh"
 
-source $(dirname $0)/config-go.sh
-
-cd "${KUBE_TARGET}"
-
-BINARIES="proxy integration apiserver controller-manager kubelet kubecfg"
-
-if [ $# -gt 0 ]; then
-  BINARIES="$@"
-fi
-
-for b in $BINARIES; do
-  echo "+++ Building ${b}"
-  go build "${KUBE_GO_PACKAGE}"/cmd/${b}
-done
+kube::golang::build_binaries "$@"
+kube::golang::place_bins

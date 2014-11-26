@@ -19,38 +19,19 @@
 # This will find the release tar, cause it to be downloaded, unpacked, installed
 # and enacted.
 
-# exit on any error
-set -e
+set -o errexit
+set -o nounset
+set -o pipefail
 
-source $(dirname $0)/util.sh
+KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+source "${KUBE_ROOT}/cluster/kube-env.sh"
+source "${KUBE_ROOT}/cluster/${KUBERNETES_PROVIDER}/util.sh"
 
-# Make sure that prerequisites are installed.
-for x in gcloud gcutil gsutil; do
-  if [ "$(which $x)" == "" ]; then
-    echo "Can't find $x in PATH, please fix and retry."
-    exit 1
-  fi
-done
+echo "Updating cluster using provider: $KUBERNETES_PROVIDER"
 
-# Find the release to use.  Generally it will be passed when doing a 'prod'
-# install and will default to the release/config.sh version when doing a
-# developer up.
-find-release $1
+verify-prereqs
+kube-push
 
-# Detect the project into $PROJECT
-detect-master
+"${KUBE_ROOT}/cluster/validate-cluster.sh"
 
-(
-  echo MASTER_RELEASE_TAR=$RELEASE_NORMALIZED/master-release.tgz
-  grep -v "^#" $(dirname $0)/templates/download-release.sh
-  echo "echo Executing configuration"
-  echo "sudo salt '*' mine.update"
-  echo "sudo salt --force-color '*' state.highstate"
-) | gcutil ssh --project ${PROJECT} --zone ${ZONE} $KUBE_MASTER bash
-
-get-password
-
-echo "Kubernetes cluster is updated.  Access the master at:"
-echo
-echo "  https://${user}:${passwd}@${KUBE_MASTER_IP}"
-echo
+echo "Done"

@@ -19,6 +19,7 @@ package util
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"runtime"
 	"time"
 
@@ -59,12 +60,6 @@ func Forever(f func(), period time.Duration) {
 	}
 }
 
-// MakeJSONString returns obj marshalled as a JSON string, ignoring any errors.
-func MakeJSONString(obj interface{}) string {
-	data, _ := json.Marshal(obj)
-	return string(data)
-}
-
 // IntOrString is a type that can hold an int or a string.  When used in
 // JSON or YAML marshalling and unmarshalling, it produces or consumes the
 // inner type.  This allows you to have, for example, a JSON field that can
@@ -83,16 +78,26 @@ const (
 	IntstrString                   // The IntOrString holds a string.
 )
 
+// NewIntOrStringFromInt creates an IntOrString object with an int value.
+func NewIntOrStringFromInt(val int) IntOrString {
+	return IntOrString{Kind: IntstrInt, IntVal: val}
+}
+
+// NewIntOrStringFromString creates an IntOrString object with a string value.
+func NewIntOrStringFromString(val string) IntOrString {
+	return IntOrString{Kind: IntstrString, StrVal: val}
+}
+
 // SetYAML implements the yaml.Setter interface.
 func (intstr *IntOrString) SetYAML(tag string, value interface{}) bool {
-	if intVal, ok := value.(int); ok {
+	switch v := value.(type) {
+	case int:
 		intstr.Kind = IntstrInt
-		intstr.IntVal = intVal
+		intstr.IntVal = v
 		return true
-	}
-	if strVal, ok := value.(string); ok {
+	case string:
 		intstr.Kind = IntstrString
-		intstr.StrVal = strVal
+		intstr.StrVal = v
 		return true
 	}
 	return false
@@ -129,6 +134,19 @@ func (intstr IntOrString) MarshalJSON() ([]byte, error) {
 	case IntstrString:
 		return json.Marshal(intstr.StrVal)
 	default:
-		panic("impossible IntOrString.Kind")
+		return []byte{}, fmt.Errorf("impossible IntOrString.Kind")
 	}
+}
+
+// Takes a list of strings and compiles them into a list of regular expressions
+func CompileRegexps(regexpStrings []string) ([]*regexp.Regexp, error) {
+	regexps := []*regexp.Regexp{}
+	for _, regexpStr := range regexpStrings {
+		r, err := regexp.Compile(regexpStr)
+		if err != nil {
+			return []*regexp.Regexp{}, err
+		}
+		regexps = append(regexps, r)
+	}
+	return regexps, nil
 }

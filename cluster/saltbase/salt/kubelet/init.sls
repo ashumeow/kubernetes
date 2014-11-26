@@ -1,35 +1,10 @@
-{% set root = '/var/src/kubelet' %}
-{% set package = 'github.com/GoogleCloudPlatform/kubernetes' %}
-{% set package_dir = root + '/src/' + package %}
+{% if grains['os_family'] == 'RedHat' %}
+{% set environment_file = '/etc/sysconfig/kubelet' %}
+{% else %}
+{% set environment_file = '/etc/default/kubelet' %}
+{% endif %}
 
-{{ package_dir }}:
-  file.recurse:
-    - source: salt://kubelet/go
-    - user: root
-    - group: staff
-    - dir_mode: 775
-    - file_mode: 664
-    - makedirs: True
-    - recurse:
-      - user
-      - group
-      - mode
-
-kubelet-third-party-go:
-  file.recurse:
-    - name: {{ root }}/src
-    - source: salt://third-party/go/src
-    - user: root
-    - group: staff
-    - dir_mode: 775
-    - file_mode: 664
-    - makedirs: True
-    - recurse:
-      - user
-      - group
-      - mode
-
-/etc/default/kubelet:
+{{ environment_file}}:
   file.managed:
     - source: salt://kubelet/default
     - template: jinja
@@ -37,22 +12,22 @@ kubelet-third-party-go:
     - group: root
     - mode: 644
 
-kubelet-build:
-  cmd.wait:
-    - cwd: {{ root }}
-    - names:
-      - go build {{ package }}/cmd/kubelet
-    - env:
-      - PATH: {{ grains['path'] }}:/usr/local/bin
-      - GOPATH: {{ root }}
-    - watch:
-      - file: {{ package_dir }}
-
 /usr/local/bin/kubelet:
-  file.symlink:
-    - target: {{ root }}/kubelet
-    - watch:
-      - cmd: kubelet-build
+  file.managed:
+    - source: salt://kube-bins/kubelet
+    - user: root
+    - group: root
+    - mode: 755
+
+{% if grains['os_family'] == 'RedHat' %}
+
+/usr/lib/systemd/system/kubelet.service:
+  file.managed:
+    - source: salt://kubelet/kubelet.service
+    - user: root
+    - group: root
+
+{% else %}
 
 /etc/init.d/kubelet:
   file.managed:
@@ -61,6 +36,20 @@ kubelet-build:
     - group: root
     - mode: 755
 
+{% endif %}
+
+# The default here is that this file is blank.  If this is the case, the kubelet
+# won't be able to parse it as JSON and it'll not be able to publish events to
+# the apiserver.  You'll see a single error line in the kubelet start up file
+# about this.
+/var/lib/kubelet/kubernetes_auth:
+  file.managed:
+    - source: salt://kubelet/kubernetes_auth
+    - user: root
+    - group: root
+    - mode: 400
+    - makedirs: true
+
 kubelet:
   group.present:
     - system: True
@@ -68,7 +57,7 @@ kubelet:
     - system: True
     - gid_from_name: True
     - shell: /sbin/nologin
-    - home: /var/kubelet
+    - home: /var/lib/kubelet
     - groups:
       - docker
     - require:
@@ -76,7 +65,9 @@ kubelet:
   service.running:
     - enable: True
     - watch:
-      - cmd: kubelet-build
       - file: /usr/local/bin/kubelet
+{% if grains['os_family'] != 'RedHat' %}
       - file: /etc/init.d/kubelet
+{% endif %}
+      - file: /var/lib/kubelet/kubernetes_auth
 

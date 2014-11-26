@@ -14,26 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-REPO_ROOT="$(realpath "$(dirname $0)/..")"
+set -o errexit
+set -o nounset
+set -o pipefail
+
+KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+
+cd ${KUBE_ROOT}
 
 result=0
+find_files() {
+  find . -not \( \
+      \( \
+        -wholename './output' \
+        -o -wholename './_output' \
+        -o -wholename './release' \
+        -o -wholename './target' \
+        -o -wholename '*/third_party/*' \
+        -o -wholename '*/Godeps/*' \
+      \) -prune \
+    \) -name '*.go'
+}
 
-dirs=("pkg" "cmd")
-
-for dir in ${dirs[@]}; do
-  for file in $(grep -r -l "" "${REPO_ROOT}/${dir}/" | grep "[.]go"); do
-    if [[ "$(${REPO_ROOT}/hooks/boilerplate.sh "${file}")" -eq "0" ]]; then
-      echo "Boilerplate header is wrong for: ${file}"
-      result=1
-    fi
-  done
+for file in $(find_files); do
+  if [[ "$("${KUBE_ROOT}/hooks/boilerplate.sh" "${file}")" -eq "0" ]]; then
+    echo "Boilerplate header is wrong for: ${file}"
+    result=1
+  fi
 done
 
-dirs=("cluster" "hack" "hooks")
+dirs=("cluster" "hack" "hooks" "build")
 
 for dir in ${dirs[@]}; do
-  for file in $(grep -r -l "" "${REPO_ROOT}/${dir}/" | grep "[.]sh"); do
-    if [[ "$(${REPO_ROOT}/hooks/boilerplate.sh "${file}")" -eq "0" ]]; then
+  for file in $(find "$dir" -name '*.sh'); do
+    if [[ "$("${KUBE_ROOT}/hooks/boilerplate.sh" "${file}")" -eq "0" ]]; then
       echo "Boilerplate header is wrong for: ${file}"
       result=1
     fi

@@ -17,15 +17,13 @@ limitations under the License.
 package master
 
 import (
-	"errors"
 	"sync"
-	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/pod"
+
 	"github.com/golang/glog"
 )
 
@@ -33,62 +31,65 @@ import (
 // that cache up to date.
 type PodCache struct {
 	containerInfo client.PodInfoGetter
-	pods          registry.PodRegistry
+	pods          pod.Registry
 	// This is a map of pod id to a map of container name to the
 	podInfo map[string]api.PodInfo
-	period  time.Duration
 	podLock sync.Mutex
 }
 
-func NewPodCache(info client.PodInfoGetter, pods registry.PodRegistry, period time.Duration) *PodCache {
+// NewPodCache returns a new PodCache which watches container information registered in the given PodRegistry.
+func NewPodCache(info client.PodInfoGetter, pods pod.Registry) *PodCache {
 	return &PodCache{
 		containerInfo: info,
 		pods:          pods,
 		podInfo:       map[string]api.PodInfo{},
-		period:        period,
 	}
 }
 
-// Implements the PodInfoGetter interface.
+// makePodCacheKey constructs a key for use in a map to address a pod with specified namespace and id
+func makePodCacheKey(podNamespace, podID string) string {
+	return podNamespace + "." + podID
+}
+
+// GetPodInfo implements the PodInfoGetter.GetPodInfo.
 // The returned value should be treated as read-only.
-func (p *PodCache) GetPodInfo(host, podID string) (api.PodInfo, error) {
+// TODO: Remove the host from this call, it's totally unnecessary.
+func (p *PodCache) GetPodInfo(host, podNamespace, podID string) (api.PodInfo, error) {
 	p.podLock.Lock()
 	defer p.podLock.Unlock()
-	value, ok := p.podInfo[podID]
+	value, ok := p.podInfo[makePodCacheKey(podNamespace, podID)]
 	if !ok {
-		return nil, errors.New("No cached pod info")
-	} else {
-		return value, nil
+		return nil, client.ErrPodInfoNotAvailable
 	}
+	return value, nil
 }
 
-func (p *PodCache) updatePodInfo(host, id string) error {
-	info, err := p.containerInfo.GetPodInfo(host, id)
+func (p *PodCache) updatePodInfo(host, podNamespace, podID string) error {
+	info, err := p.containerInfo.GetPodInfo(host, podNamespace, podID)
 	if err != nil {
 		return err
 	}
 	p.podLock.Lock()
 	defer p.podLock.Unlock()
-	p.podInfo[id] = info
+	p.podInfo[makePodCacheKey(podNamespace, podID)] = info
 	return nil
 }
 
-// Update information about all containers.  Either called by Loop() below, or one-off.
+// UpdateAllContainers updates information about all containers.  Either called by Loop() below, or one-off.
 func (p *PodCache) UpdateAllContainers() {
-	pods, err := p.pods.ListPods(labels.Everything())
+	ctx := api.NewContext()
+	pods, err := p.pods.ListPods(ctx, labels.Everything())
 	if err != nil {
-		glog.Errorf("Error synchronizing container list: %#v", err)
+		glog.Errorf("Error synchronizing container list: %v", err)
 		return
 	}
-	for _, pod := range pods {
-		err := p.updatePodInfo(pod.CurrentState.Host, pod.ID)
-		if err != nil {
-			glog.Errorf("Error synchronizing container: %#v", err)
+	for _, pod := range pods.Items {
+		if pod.Status.Host == "" {
+			continue
+		}
+		err := p.updatePodInfo(pod.Status.Host, pod.Namespace, pod.Name)
+		if err != nil && err != client.ErrPodInfoNotAvailable {
+			glog.Errorf("Error synchronizing container: %v", err)
 		}
 	}
-}
-
-// Loop runs forever, it is expected to be placed in a go routine.
-func (p *PodCache) Loop() {
-	util.Forever(func() { p.UpdateAllContainers() }, p.period)
 }

@@ -23,24 +23,24 @@ import (
 	"testing"
 )
 
-func expectNoError(t *testing.T, err error) {
-	if err != nil {
-		t.Errorf("Unexpected error: %#v", err)
-	}
-}
-
 func TestFakeHandlerPath(t *testing.T) {
 	handler := FakeHandler{}
 	server := httptest.NewServer(&handler)
+	defer server.Close()
 	method := "GET"
 	path := "/foo/bar"
 	body := "somebody"
 
 	req, err := http.NewRequest(method, server.URL+path, bytes.NewBufferString(body))
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
 	client := http.Client{}
 	_, err = client.Do(req)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	handler.ValidateRequest(t, path, method, &body)
 }
@@ -48,14 +48,20 @@ func TestFakeHandlerPath(t *testing.T) {
 func TestFakeHandlerPathNoBody(t *testing.T) {
 	handler := FakeHandler{}
 	server := httptest.NewServer(&handler)
+	defer server.Close()
 	method := "GET"
 	path := "/foo/bar"
 
 	req, err := http.NewRequest(method, server.URL+path, nil)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
 	client := http.Client{}
 	_, err = client.Do(req)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	handler.ValidateRequest(t, path, method, nil)
 }
@@ -68,18 +74,26 @@ func (f *fakeError) Errorf(format string, args ...interface{}) {
 	f.errors = append(f.errors, format)
 }
 
+func (f *fakeError) Logf(format string, args ...interface{}) {}
+
 func TestFakeHandlerWrongPath(t *testing.T) {
 	handler := FakeHandler{}
 	server := httptest.NewServer(&handler)
+	defer server.Close()
 	method := "GET"
 	path := "/foo/bar"
 	fakeT := fakeError{}
 
 	req, err := http.NewRequest(method, server.URL+"/foo/baz", nil)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
 	client := http.Client{}
 	_, err = client.Do(req)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	handler.ValidateRequest(&fakeT, path, method, nil)
 	if len(fakeT.errors) != 1 {
@@ -90,15 +104,21 @@ func TestFakeHandlerWrongPath(t *testing.T) {
 func TestFakeHandlerWrongMethod(t *testing.T) {
 	handler := FakeHandler{}
 	server := httptest.NewServer(&handler)
+	defer server.Close()
 	method := "GET"
 	path := "/foo/bar"
 	fakeT := fakeError{}
 
 	req, err := http.NewRequest("PUT", server.URL+path, nil)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
 	client := http.Client{}
 	_, err = client.Do(req)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	handler.ValidateRequest(&fakeT, path, method, nil)
 	if len(fakeT.errors) != 1 {
@@ -109,16 +129,22 @@ func TestFakeHandlerWrongMethod(t *testing.T) {
 func TestFakeHandlerWrongBody(t *testing.T) {
 	handler := FakeHandler{}
 	server := httptest.NewServer(&handler)
+	defer server.Close()
 	method := "GET"
 	path := "/foo/bar"
 	body := "somebody"
 	fakeT := fakeError{}
 
 	req, err := http.NewRequest(method, server.URL+path, bytes.NewBufferString(body))
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
 	client := http.Client{}
 	_, err = client.Do(req)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	otherbody := "otherbody"
 	handler.ValidateRequest(&fakeT, path, method, &otherbody)
@@ -130,16 +156,22 @@ func TestFakeHandlerWrongBody(t *testing.T) {
 func TestFakeHandlerNilBody(t *testing.T) {
 	handler := FakeHandler{}
 	server := httptest.NewServer(&handler)
+	defer server.Close()
 	method := "GET"
 	path := "/foo/bar"
 	body := "somebody"
 	fakeT := fakeError{}
 
 	req, err := http.NewRequest(method, server.URL+path, nil)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
 	client := http.Client{}
 	_, err = client.Do(req)
-	expectNoError(t, err)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	handler.ValidateRequest(&fakeT, path, method, &body)
 	if len(fakeT.errors) != 1 {

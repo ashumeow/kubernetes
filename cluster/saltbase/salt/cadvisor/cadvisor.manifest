@@ -2,25 +2,31 @@ version: v1beta2
 id: cadvisor-agent
 containers:
   - name: cadvisor
-    image: google/cadvisor
+    image: google/cadvisor:latest
     ports:
       - name: http
         containerPort: 8080
-        hostPort: 5000
+        hostPort: 4194
     volumeMounts:
-      - name: var-run
+      - name: varrun
         mountPath: /var/run
         readOnly: false
-        mountType: HOST
-      - name: var-lib-docker
+      - name: varlibdocker
         mountPath: /var/lib/docker
         readOnly: true
-        mountType: HOST
       - name: cgroups
         mountPath: /sys/fs/cgroup
         readOnly: true
-        mountType: HOST
 volumes:
-  -name: var-run
-  -name: var-lib-docker
-  -name: var-cgroups
+  - name: varrun
+    source:
+      hostDir:
+        path: /var/run
+  - name: varlibdocker
+    source:
+      hostDir:
+        path: /var/lib/docker
+  - name: cgroups
+    source:
+      hostDir:
+        path: /sys/fs/cgroup
